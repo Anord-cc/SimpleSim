@@ -1,15 +1,48 @@
+import base64
+import importlib
+import json
 import math
 import os
 import secrets
 import sqlite3
 import time
 from functools import wraps
-from urllib.parse import urlencode
+from typing import Any
+from urllib.parse import urlencode, urlparse
 
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, request, send_from_directory, session
 from flask_cors import CORS
+
+base64url_to_bytes: Any = None
+generate_authentication_options: Any = None
+generate_registration_options: Any = None
+options_to_json: Any = None
+verify_authentication_response: Any = None
+verify_registration_response: Any = None
+AuthenticatorSelectionCriteria: Any = None
+PublicKeyCredentialDescriptor: Any = None
+ResidentKeyRequirement: Any = None
+UserVerificationRequirement: Any = None
+
+try:
+    webauthn_module = importlib.import_module("webauthn")
+    webauthn_structs = importlib.import_module("webauthn.helpers.structs")
+
+    base64url_to_bytes = webauthn_module.base64url_to_bytes
+    generate_authentication_options = webauthn_module.generate_authentication_options
+    generate_registration_options = webauthn_module.generate_registration_options
+    options_to_json = webauthn_module.options_to_json
+    verify_authentication_response = webauthn_module.verify_authentication_response
+    verify_registration_response = webauthn_module.verify_registration_response
+    AuthenticatorSelectionCriteria = webauthn_structs.AuthenticatorSelectionCriteria
+    PublicKeyCredentialDescriptor = webauthn_structs.PublicKeyCredentialDescriptor
+    ResidentKeyRequirement = webauthn_structs.ResidentKeyRequirement
+    UserVerificationRequirement = webauthn_structs.UserVerificationRequirement
+    WEBAUTHN_AVAILABLE = True
+except ImportError:
+    WEBAUTHN_AVAILABLE = False
 
 load_dotenv()
 
@@ -38,6 +71,55 @@ _vatsim_cache   = {"data": None, "fetched_at": 0}
 VATSIM_CACHE_TTL_SECONDS = max(5, int(os.environ.get("VATSIM_CACHE_TTL_SECONDS", "15")))
 MAX_SEGMENT_GAP_SECONDS = 60 * 60 * 4
 MAX_SEGMENT_DISTANCE_KM = 900
+PASSKEY_RP_NAME = os.environ.get("PASSKEY_RP_NAME", "VATSIM HeatTracker")
+
+
+def bytes_to_base64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def parse_json_options(options) -> dict:
+    return json.loads(options_to_json(options))
+
+
+def get_passkey_rp_id() -> str:
+    configured = os.environ.get("PASSKEY_RP_ID")
+    if configured:
+        return configured
+
+    redirect_uri = os.environ.get("DISCORD_REDIRECT_URI")
+    if redirect_uri:
+        parsed = urlparse(redirect_uri)
+        if parsed.hostname:
+            return parsed.hostname
+
+    return request.host.split(":", 1)[0]
+
+
+def get_passkey_origin() -> str:
+    configured = os.environ.get("PASSKEY_ORIGIN")
+    if configured:
+        return configured
+
+    redirect_uri = os.environ.get("DISCORD_REDIRECT_URI")
+    if redirect_uri:
+        parsed = urlparse(redirect_uri)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+
+    return f"{request.scheme}://{request.host}"
+
+
+def ensure_webauthn():
+    if not WEBAUTHN_AVAILABLE:
+        return jsonify({
+            "error": "Passkeys are not available until the `webauthn` package is installed."
+        }), 503
+    return None
+
+
+def is_discord_configured() -> bool:
+    return bool(DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and DISCORD_REDIRECT_URI)
 
 def get_vatsim_data():
     now = time.time()
@@ -134,12 +216,36 @@ def build_track_segments(rows):
 
     return points, segments
 
+
+def get_current_user():
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+
+    with get_db() as conn:
+        return conn.execute(
+            """
+            SELECT
+                users.id,
+                users.discord_id,
+                users.discord_name,
+                users.vatsim_id,
+                EXISTS(
+                    SELECT 1 FROM passkeys WHERE passkeys.user_id = users.id
+                ) AS has_passkey
+            FROM users
+            WHERE users.id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+
 # ── Database ──────────────────────────────────────────────────────────────────
 DB_PATH = os.path.join(os.path.dirname(__file__), "flights.db")
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 def init_db():
@@ -175,8 +281,23 @@ def init_db():
                 ended_at    DATETIME
             );
 
+            CREATE TABLE IF NOT EXISTS passkeys (
+                id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id                INTEGER NOT NULL,
+                credential_id          TEXT UNIQUE NOT NULL,
+                public_key             TEXT NOT NULL,
+                sign_count             INTEGER NOT NULL DEFAULT 0,
+                transports             TEXT,
+                credential_device_type TEXT,
+                backed_up              INTEGER NOT NULL DEFAULT 0,
+                created_at             DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_used_at           DATETIME,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_points_vatsim  ON flight_points(vatsim_id);
             CREATE INDEX IF NOT EXISTS idx_flights_vatsim ON flights(vatsim_id);
+            CREATE INDEX IF NOT EXISTS idx_passkeys_user  ON passkeys(user_id);
         """)
 
 init_db()
@@ -185,7 +306,7 @@ init_db()
 def require_auth(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        if not session.get("discord_id"):
+        if not session.get("user_id"):
             return jsonify({"error": "unauthorized"}), 401
         return fn(*args, **kwargs)
     return wrapper
@@ -193,7 +314,7 @@ def require_auth(fn):
 def require_linked(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        if not session.get("discord_id"):
+        if not session.get("user_id"):
             return jsonify({"error": "unauthorized"}), 401
         if not session.get("vatsim_id"):
             return jsonify({"error": "no_vatsim_linked"}), 403
@@ -203,6 +324,9 @@ def require_linked(fn):
 # ── Discord OAuth ─────────────────────────────────────────────────────────────
 @app.route("/auth/login")
 def login():
+    if not is_discord_configured():
+        return redirect("/?error=discord_not_configured")
+
     state = secrets.token_urlsafe(16)
     session["oauth_state"] = state
     params = {
@@ -216,6 +340,9 @@ def login():
 
 @app.route("/auth/callback")
 def callback():
+    if not is_discord_configured():
+        return redirect("/?error=discord_not_configured")
+
     if request.args.get("error"):
         return redirect(f"/?error={request.args.get('error')}")
 
@@ -267,13 +394,16 @@ def callback():
             ON CONFLICT(discord_id) DO UPDATE SET discord_name = excluded.discord_name
         """, (discord_id, discord_name))
         row = conn.execute(
-            "SELECT vatsim_id FROM users WHERE discord_id = ?", (discord_id,)
+            "SELECT id, vatsim_id FROM users WHERE discord_id = ?", (discord_id,)
         ).fetchone()
+        user_id = row["id"] if row else None
         vatsim_id = row["vatsim_id"] if row else None
 
+    session["user_id"]      = user_id
     session["discord_id"]   = discord_id
     session["discord_name"] = discord_name
     session["vatsim_id"]    = vatsim_id
+    session["auth_method"]  = "discord"
 
     return redirect("/link-vatsim" if not vatsim_id else "/dashboard")
 
@@ -286,7 +416,7 @@ def logout():
 @app.route("/api/link-vatsim", methods=["POST"])
 @require_auth
 def link_vatsim():
-    discord_id = session["discord_id"]
+    user_id     = session["user_id"]
     data       = request.get_json() or {}
     vatsim_id  = str(data.get("vatsim_id", "")).strip()
 
@@ -296,8 +426,8 @@ def link_vatsim():
     try:
         with get_db() as conn:
             conn.execute(
-                "UPDATE users SET vatsim_id = ? WHERE discord_id = ?",
-                (vatsim_id, discord_id)
+                "UPDATE users SET vatsim_id = ? WHERE id = ?",
+                (vatsim_id, user_id)
             )
     except sqlite3.IntegrityError:
         return jsonify({"error": "That VATSIM CID is already linked to another account"}), 409
@@ -310,8 +440,8 @@ def link_vatsim():
 def unlink_vatsim():
     with get_db() as conn:
         conn.execute(
-            "UPDATE users SET vatsim_id = NULL WHERE discord_id = ?",
-            (session["discord_id"],)
+            "UPDATE users SET vatsim_id = NULL WHERE id = ?",
+            (session["user_id"],)
         )
     session["vatsim_id"] = None
     return jsonify({"ok": True})
@@ -319,14 +449,204 @@ def unlink_vatsim():
 # ── User info ─────────────────────────────────────────────────────────────────
 @app.route("/api/me")
 def me():
-    if not session.get("discord_id"):
+    user = get_current_user()
+    if not user:
         return jsonify({"authenticated": False}), 401
     return jsonify({
         "authenticated": True,
-        "discord_id":    session["discord_id"],
-        "discord_name":  session.get("discord_name", ""),
-        "vatsim_id":     session.get("vatsim_id"),
+        "user_id":       user["id"],
+        "discord_id":    user["discord_id"],
+        "discord_name":  user["discord_name"] or "",
+        "vatsim_id":     user["vatsim_id"],
+        "auth_method":   session.get("auth_method", "discord"),
+        "has_passkey":   bool(user["has_passkey"]),
     })
+
+
+@app.route("/api/passkey/register/options", methods=["POST"])
+@require_auth
+def passkey_register_options():
+    unavailable = ensure_webauthn()
+    if unavailable:
+        return unavailable
+
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+
+    with get_db() as conn:
+        credentials = conn.execute(
+            "SELECT credential_id FROM passkeys WHERE user_id = ?",
+            (user["id"],),
+        ).fetchall()
+
+    user_label = user["discord_name"] or user["discord_id"] or f"user-{user['id']}"
+    options = generate_registration_options(
+        rp_id=get_passkey_rp_id(),
+        rp_name=PASSKEY_RP_NAME,
+        user_id=str(user["id"]).encode("utf-8"),
+        user_name=user_label,
+        user_display_name=user_label,
+        authenticator_selection=AuthenticatorSelectionCriteria(
+            resident_key=ResidentKeyRequirement.REQUIRED,
+        ),
+        user_verification=UserVerificationRequirement.REQUIRED,
+        exclude_credentials=[
+            PublicKeyCredentialDescriptor(id=base64url_to_bytes(cred["credential_id"]))
+            for cred in credentials
+        ],
+    )
+    options_json = parse_json_options(options)
+    session["passkey_registration_challenge"] = options_json["challenge"]
+    return jsonify(options_json)
+
+
+@app.route("/api/passkey/register/verify", methods=["POST"])
+@require_auth
+def passkey_register_verify():
+    unavailable = ensure_webauthn()
+    if unavailable:
+        return unavailable
+
+    challenge = session.pop("passkey_registration_challenge", None)
+    if not challenge:
+        return jsonify({"error": "registration_expired"}), 400
+
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+
+    credential = request.get_json() or {}
+    try:
+        verification = verify_registration_response(
+            credential=credential,
+            expected_challenge=base64url_to_bytes(challenge),
+            expected_rp_id=get_passkey_rp_id(),
+            expected_origin=get_passkey_origin(),
+            require_user_verification=True,
+        )
+    except Exception as exc:
+        return jsonify({"error": f"registration_failed: {exc}"}), 400
+
+    transports = credential.get("response", {}).get("transports", [])
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO passkeys (
+                user_id, credential_id, public_key, sign_count,
+                transports, credential_device_type, backed_up, last_used_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(credential_id) DO UPDATE SET
+                public_key = excluded.public_key,
+                sign_count = excluded.sign_count,
+                transports = excluded.transports,
+                credential_device_type = excluded.credential_device_type,
+                backed_up = excluded.backed_up,
+                last_used_at = CURRENT_TIMESTAMP
+            """,
+            (
+                user["id"],
+                bytes_to_base64url(verification.credential_id),
+                bytes_to_base64url(verification.credential_public_key),
+                verification.sign_count,
+                json.dumps(transports),
+                verification.credential_device_type,
+                int(bool(verification.credential_backed_up)),
+            ),
+        )
+
+    return jsonify({"ok": True})
+
+
+@app.route("/api/passkey/auth/options", methods=["POST"])
+def passkey_auth_options():
+    unavailable = ensure_webauthn()
+    if unavailable:
+        return unavailable
+
+    options = generate_authentication_options(
+        rp_id=get_passkey_rp_id(),
+        user_verification=UserVerificationRequirement.REQUIRED,
+    )
+    options_json = parse_json_options(options)
+    session["passkey_authentication_challenge"] = options_json["challenge"]
+    return jsonify(options_json)
+
+
+@app.route("/api/passkey/auth/verify", methods=["POST"])
+def passkey_auth_verify():
+    unavailable = ensure_webauthn()
+    if unavailable:
+        return unavailable
+
+    challenge = session.pop("passkey_authentication_challenge", None)
+    if not challenge:
+        return jsonify({"error": "authentication_expired"}), 400
+
+    credential = request.get_json() or {}
+    credential_id = credential.get("id")
+    if not credential_id:
+        return jsonify({"error": "missing_credential_id"}), 400
+
+    with get_db() as conn:
+        passkey = conn.execute(
+            """
+            SELECT
+                passkeys.id,
+                passkeys.user_id,
+                passkeys.credential_id,
+                passkeys.public_key,
+                passkeys.sign_count,
+                users.discord_id,
+                users.discord_name,
+                users.vatsim_id
+            FROM passkeys
+            JOIN users ON users.id = passkeys.user_id
+            WHERE passkeys.credential_id = ?
+            """,
+            (credential_id,),
+        ).fetchone()
+
+        if not passkey:
+            return jsonify({"error": "unknown_passkey"}), 404
+
+        try:
+            verification = verify_authentication_response(
+                credential=credential,
+                expected_challenge=base64url_to_bytes(challenge),
+                expected_rp_id=get_passkey_rp_id(),
+                expected_origin=get_passkey_origin(),
+                credential_public_key=base64url_to_bytes(passkey["public_key"]),
+                credential_current_sign_count=passkey["sign_count"],
+                require_user_verification=True,
+            )
+        except Exception as exc:
+            return jsonify({"error": f"authentication_failed: {exc}"}), 400
+
+        conn.execute(
+            """
+            UPDATE passkeys
+            SET sign_count = ?, last_used_at = CURRENT_TIMESTAMP,
+                credential_device_type = ?, backed_up = ?
+            WHERE id = ?
+            """,
+            (
+                verification.new_sign_count,
+                verification.credential_device_type,
+                int(bool(verification.credential_backed_up)),
+                passkey["id"],
+            ),
+        )
+
+    session.clear()
+    session["user_id"] = passkey["user_id"]
+    session["discord_id"] = passkey["discord_id"]
+    session["discord_name"] = passkey["discord_name"]
+    session["vatsim_id"] = passkey["vatsim_id"]
+    session["auth_method"] = "passkey"
+
+    return jsonify({"ok": True, "vatsim_id": passkey["vatsim_id"]})
 
 # ── Flight data ───────────────────────────────────────────────────────────────
 @app.route("/api/live")
