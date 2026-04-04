@@ -69,6 +69,11 @@ ALLOWED_DISCORD_IDS = {
 VATSIM_DATA_URL = "https://data.vatsim.net/v3/vatsim-data.json"
 _vatsim_cache   = {"data": None, "fetched_at": 0}
 VATSIM_CACHE_TTL_SECONDS = max(5, int(os.environ.get("VATSIM_CACHE_TTL_SECONDS", "15")))
+SIMBRIEF_API_URL = "https://www.simbrief.com/api/xml.fetcher.php"
+SIMBRIEF_USERID = (os.environ.get("SIMBRIEF_USERID") or "").strip()
+SIMBRIEF_USERNAME = (os.environ.get("SIMBRIEF_USERNAME") or "").strip()
+SIMBRIEF_CACHE_TTL_SECONDS = max(30, int(os.environ.get("SIMBRIEF_CACHE_TTL_SECONDS", "300")))
+_simbrief_cache = {"data": None, "fetched_at": 0, "identity": None}
 MAX_SEGMENT_GAP_SECONDS = 60 * 60 * 4
 MAX_SEGMENT_DISTANCE_KM = 900
 PASSKEY_RP_NAME = os.environ.get("PASSKEY_RP_NAME", "VATSIM HeatTracker")
@@ -137,6 +142,232 @@ def get_vatsim_data():
     except Exception as e:
         print(f"VATSIM data fetch error: {e}")
     return _vatsim_cache["data"]
+
+
+def coerce_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        for key in ("#text", "text", "value"):
+            nested = value.get(key)
+            if nested not in (None, ""):
+                return str(nested).strip()
+        return ""
+    return str(value).strip()
+
+
+def coerce_float(value: Any):
+    text = coerce_text(value)
+    if not text:
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def coerce_int(value: Any):
+    text = coerce_text(value)
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return None
+
+
+def unix_to_iso8601(value: Any) -> str | None:
+    unix_value = coerce_int(value)
+    if unix_value is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(unix_value))
+
+
+def get_simbrief_identity():
+    if SIMBRIEF_USERID:
+        return ("userid", SIMBRIEF_USERID)
+    if SIMBRIEF_USERNAME:
+        return ("username", SIMBRIEF_USERNAME)
+    return None
+
+
+def extract_simbrief_route_points(payload: dict):
+    origin = payload.get("origin") or {}
+    destination = payload.get("destination") or {}
+    navlog = payload.get("navlog") or {}
+    fixes = navlog.get("fix") if isinstance(navlog, dict) else []
+    if isinstance(fixes, dict):
+        fixes = [fixes]
+
+    route_points = []
+    previous = None
+
+    def append_point(point):
+        nonlocal previous
+        if point["lat"] is None or point["lng"] is None:
+            return
+        if previous and abs(previous["lat"] - point["lat"]) < 1e-6 and abs(previous["lng"] - point["lng"]) < 1e-6:
+            return
+        route_points.append(point)
+        previous = point
+
+    append_point({
+        "ident": coerce_text(origin.get("icao_code")) or coerce_text(origin.get("iata_code")) or "DEP",
+        "name": coerce_text(origin.get("name")),
+        "lat": coerce_float(origin.get("pos_lat")),
+        "lng": coerce_float(origin.get("pos_long")),
+        "stage": "DEP",
+        "airway": "",
+    })
+
+    for fix in fixes or []:
+        if not isinstance(fix, dict):
+            continue
+        lat = coerce_float(fix.get("pos_lat"))
+        lng = coerce_float(fix.get("pos_long"))
+        if lat is None or lng is None:
+            continue
+
+        point = {
+            "ident": coerce_text(fix.get("ident")) or coerce_text(fix.get("name")),
+            "name": coerce_text(fix.get("name")),
+            "lat": lat,
+            "lng": lng,
+            "stage": coerce_text(fix.get("stage")),
+            "airway": coerce_text(fix.get("via_airway")),
+        }
+        append_point(point)
+
+    append_point({
+        "ident": coerce_text(destination.get("icao_code")) or coerce_text(destination.get("iata_code")) or "ARR",
+        "name": coerce_text(destination.get("name")),
+        "lat": coerce_float(destination.get("pos_lat")),
+        "lng": coerce_float(destination.get("pos_long")),
+        "stage": "ARR",
+        "airway": "",
+    })
+
+    return route_points
+
+
+def build_simbrief_summary(payload: dict):
+    params = payload.get("params") or {}
+    general = payload.get("general") or {}
+    origin = payload.get("origin") or {}
+    destination = payload.get("destination") or {}
+    aircraft = payload.get("aircraft") or {}
+    route_points = extract_simbrief_route_points(payload)
+    identity = get_simbrief_identity()
+
+    departure = coerce_text(origin.get("icao_code")) or coerce_text(origin.get("iata_code"))
+    arrival = coerce_text(destination.get("icao_code")) or coerce_text(destination.get("iata_code"))
+    airline = coerce_text(general.get("icao_airline"))
+    flight_number = coerce_text(general.get("flight_number"))
+    callsign = coerce_text(general.get("callsign")) or f"{airline}{flight_number}".strip()
+    if not callsign:
+        callsign = coerce_text(general.get("flightid"))
+
+    bounds = None
+    if route_points:
+        latitudes = [point["lat"] for point in route_points]
+        longitudes = [point["lng"] for point in route_points]
+        bounds = {
+            "southWest": [min(latitudes), min(longitudes)],
+            "northEast": [max(latitudes), max(longitudes)],
+        }
+
+    return {
+        "configured": True,
+        "available": bool(route_points or departure or arrival),
+        "identity_mode": identity[0] if identity else None,
+        "callsign": callsign,
+        "flight_number": flight_number,
+        "airline": airline,
+        "departure": departure,
+        "arrival": arrival,
+        "departure_name": coerce_text(origin.get("name")),
+        "arrival_name": coerce_text(destination.get("name")),
+        "aircraft": (
+            coerce_text(aircraft.get("icaocode"))
+            or coerce_text(aircraft.get("icao_code"))
+            or coerce_text(general.get("icao_aircraft"))
+            or coerce_text(general.get("aircraft"))
+        ),
+        "route": coerce_text(general.get("route")),
+        "route_points": route_points,
+        "generated_at": unix_to_iso8601(params.get("time_generated")),
+        "request_id": coerce_text(params.get("request_id")),
+        "distance_nm": coerce_int(general.get("route_distance")),
+        "bounds": bounds,
+    }
+
+
+def get_simbrief_data():
+    identity = get_simbrief_identity()
+    if not identity:
+        return {
+            "configured": False,
+            "available": False,
+            "identity_mode": None,
+            "callsign": "",
+            "flight_number": "",
+            "airline": "",
+            "departure": "",
+            "arrival": "",
+            "departure_name": "",
+            "arrival_name": "",
+            "aircraft": "",
+            "route": "",
+            "route_points": [],
+            "generated_at": None,
+            "request_id": "",
+            "distance_nm": None,
+            "bounds": None,
+            "error": "missing_simbrief_identity",
+        }
+
+    now = time.time()
+    if (
+        _simbrief_cache["data"] is not None
+        and _simbrief_cache["identity"] == identity
+        and now - _simbrief_cache["fetched_at"] < SIMBRIEF_CACHE_TTL_SECONDS
+    ):
+        return _simbrief_cache["data"]
+
+    params = {identity[0]: identity[1], "json": 1}
+    try:
+        response = requests.get(SIMBRIEF_API_URL, params=params, timeout=12)
+        response.raise_for_status()
+        data = build_simbrief_summary(response.json())
+    except Exception as exc:
+        print(f"SimBrief data fetch error: {exc}")
+        if _simbrief_cache["data"] is not None:
+            return _simbrief_cache["data"]
+        return {
+            "configured": True,
+            "available": False,
+            "identity_mode": identity[0],
+            "callsign": "",
+            "flight_number": "",
+            "airline": "",
+            "departure": "",
+            "arrival": "",
+            "departure_name": "",
+            "arrival_name": "",
+            "aircraft": "",
+            "route": "",
+            "route_points": [],
+            "generated_at": None,
+            "request_id": "",
+            "distance_nm": None,
+            "bounds": None,
+            "error": "simbrief_fetch_failed",
+        }
+
+    _simbrief_cache["data"] = data
+    _simbrief_cache["fetched_at"] = now
+    _simbrief_cache["identity"] = identity
+    return data
 
 def find_pilot(vatsim_id: str):
     data = get_vatsim_data()
@@ -794,6 +1025,12 @@ def stats():
     })
 
 # ── Serve frontend ────────────────────────────────────────────────────────────
+@app.route("/api/simbrief")
+@require_auth
+def simbrief():
+    return jsonify(get_simbrief_data())
+
+
 @app.route("/")
 def index():
     return send_from_directory("../frontend", "index.html")
