@@ -1,95 +1,173 @@
 # VATSIM HeatTracker
 
-Track your VATSIM flights and visualize them as a heatmap.
+Track a linked VATSIM CID, store flown routes over time, and view them in a wrapped flat map or globe view.
+
+## What It Actually Uses
+
+Authentication is handled by:
+- Discord OAuth
+- Passkeys (WebAuthn), after a user has signed in once and enrolled one
+
+VATSIM is used for:
+- linking the CID you want to track
+- reading live public pilot data from the VATSIM data feed
+
+So the app does **not** use VATSIM OAuth for login. It uses Discord/passkeys for account access, then links a VATSIM CID to that account.
 
 ## Features
-- **Sign in with VATSIM** (OAuth2 via VATSIM Connect)
-- **Live flight tracking** — polls VATSIM data feed every 60 seconds
-- **Route heatmap** — every position point you fly contributes to a persistent heatmap
-- **Flight history** — callsign, route, aircraft per flight
-- **Statistics** — total tracked points, flights, and top routes
+
+- Discord OAuth sign-in
+- Optional passkey sign-in after enrollment
+- VATSIM CID linking
+- Live VATSIM flight tracking
+- Historical route map and density map
+- Wrapped flat-map rendering for long-haul routes
+- Globe view
+- SimBrief route overlay
+- Flight history and route statistics
 
 ## Project Structure
 
-```
+```text
 vatsim-heatmap/
-├── backend/
-│   ├── app.py              # Flask app — OAuth, API routes, DB
-│   ├── requirements.txt
-│   ├── flights.db          # Created automatically on first run
-│   └── .env.example        # Copy to .env and fill in
-└── frontend/
-    ├── index.html          # Landing / login page
-    └── dashboard.html      # Main dashboard with map
+|-- backend/
+|   |-- app.py
+|   |-- requirements.txt
+|   |-- flights.db
+|   `-- .env.example
+`-- frontend/
+    |-- index.html
+    |-- link-vatsim.html
+    |-- dashboard.html
+    `-- roadmap.html
 ```
 
 ## Setup
 
-### 1. Register on VATSIM Connect
+### 1. Create a Discord OAuth app
 
-1. Go to https://auth.vatsim.net/
-2. Create an OAuth application
-3. Set the **Redirect URI** to: `http://localhost:5000/auth/callback`
-4. Note your **Client ID** and **Client Secret**
+1. Open [Discord Developer Portal](https://discord.com/developers/applications)
+2. Create an application
+3. Add an OAuth redirect URI:
+   `http://localhost:5000/auth/callback`
+4. Copy the client ID and client secret
 
-### 2. Configure Environment
+### 2. Configure environment variables
 
-```bash
-cd backend
-cp .env.example .env
-# Edit .env with your credentials
+Create `backend/.env` from `backend/.env.example`.
+
+Minimum local setup:
+
+```env
+DISCORD_CLIENT_ID=your_discord_client_id
+DISCORD_CLIENT_SECRET=your_discord_client_secret
+DISCORD_REDIRECT_URI=http://localhost:5000/auth/callback
+SECRET_KEY=replace_with_a_long_random_secret
+ALLOWED_DISCORD_IDS=123456789012345678
 ```
 
-### 3. Install & Run Backend
+Optional variables:
+
+```env
+SIMBRIEF_USERNAME=
+SIMBRIEF_USERID=
+PASSKEY_RP_ID=localhost
+PASSKEY_ORIGIN=http://localhost:5000
+PASSKEY_RP_NAME=VATSIM HeatTracker
+VATSIM_CACHE_TTL_SECONDS=15
+SIMBRIEF_CACHE_TTL_SECONDS=300
+TRACKER_POLL_SECONDS=20
+TRACKER_MIN_INSERT_SECONDS=10
+```
+
+Notes:
+- `ALLOWED_DISCORD_IDS` is a comma-separated allowlist of Discord user IDs.
+- `PASSKEY_RP_ID` and `PASSKEY_ORIGIN` should match the real site hostname and origin in production.
+- Passkeys require HTTPS in production.
+
+### 3. Install dependencies
 
 ```bash
 cd backend
 python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
+source venv/bin/activate
 pip install -r requirements.txt
-python app.py
 ```
 
-The server runs on **http://localhost:5000**
+On Windows PowerShell:
 
-### 4. Open the App
+```powershell
+cd backend
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
 
-Visit http://localhost:5000 in your browser and click **Sign in with VATSIM**.
+### 4. Start the backend
 
-## How It Works
+From the project root:
 
-| Step | Detail |
-|------|--------|
-| Login | VATSIM OAuth2 → access token stored in server session |
-| Live Poll | Every 60 seconds, the dashboard calls `/api/live` |
-| `/api/live` | Fetches `data.vatsim.net/v3/vatsim-data.json`, finds your CID, saves lat/lng to `flight_points` table |
-| `/api/heatmap` | Aggregates all your `flight_points` (rounded to 0.01°) and returns weighted points for Leaflet.heat |
-| Heatmap | `leaflet.heat` renders a gradient overlay on OpenStreetMap tiles |
+```powershell
+python backend\app.py
+```
 
-## API Endpoints
+The app runs on:
+- [http://localhost:5000](http://localhost:5000)
 
-| Route | Description |
-|-------|-------------|
-| `GET /auth/login` | Redirect to VATSIM OAuth |
-| `GET /auth/callback` | OAuth callback, creates session |
-| `GET /auth/logout` | Clear session |
-| `GET /api/me` | Current user info |
-| `GET /api/live` | Current flight + records position |
-| `GET /api/heatmap` | All recorded positions |
-| `GET /api/flights` | Recent 20 flights |
-| `GET /api/stats` | Stats + top routes |
+## Login Flow
 
-## Database Schema
+1. Sign in with Discord
+2. If your Discord ID is allowed, your account session is created
+3. Link your VATSIM CID on `/link-vatsim`
+4. Optionally add a passkey for future sign-ins
+5. Open `/dashboard` to view live and historical data
 
-- **users** — VATSIM CID, name, email
-- **flight_points** — lat/lng/altitude/groundspeed per poll interval
-- **flights** — flight session with callsign, dep, arr, aircraft
+## How Tracking Works
+
+1. The backend polls the VATSIM public data feed on a background interval
+2. For every linked VATSIM CID currently online, it records position snapshots
+3. Snapshots are written into `flight_points`
+4. Flights are grouped into `flights`
+5. `/api/heatmap` builds route segments, dense nodes, and recent tracks from stored points
+
+## Main Routes
+
+### Auth and account
+
+- `GET /auth/login` - start Discord OAuth
+- `GET /auth/callback` - Discord OAuth callback
+- `GET /auth/logout` - end session
+- `GET /api/me` - current logged-in user
+- `POST /api/passkey/register/options` - start passkey registration
+- `POST /api/passkey/register/verify` - finish passkey registration
+- `POST /api/passkey/auth/options` - start passkey login
+- `POST /api/passkey/auth/verify` - finish passkey login
+
+### VATSIM linking
+
+- `POST /api/link-vatsim` - link a VATSIM CID
+- `POST /api/unlink-vatsim` - unlink the VATSIM CID
+
+### Tracking and dashboard data
+
+- `GET /api/live` - current live flight state for the linked CID
+- `GET /api/heatmap` - stored route and density data
+- `GET /api/flights` - recent flights
+- `GET /api/stats` - totals and top routes
+- `GET /api/simbrief` - latest SimBrief summary and route overlay
+
+## Database
+
+- `users` - Discord account identity plus linked VATSIM CID
+- `passkeys` - enrolled WebAuthn credentials
+- `flight_points` - recorded VATSIM position snapshots
+- `flights` - tracked flight sessions
 
 ## Deployment Notes
 
-For production:
-- Use `gunicorn` instead of Flask dev server
-- Set a strong `SECRET_KEY` in `.env`
-- Update `REDIRECT_URI` to your public domain
-- Consider adding `flask-limiter` for rate limiting
-- Add HTTPS (required by VATSIM Connect in production)
+- Use a production WSGI server instead of Flask debug serving
+- Set a strong `SECRET_KEY`
+- Set `DISCORD_REDIRECT_URI` to your public callback URL
+- Set `PASSKEY_RP_ID` and `PASSKEY_ORIGIN` to the production domain
+- Serve over HTTPS, especially for passkeys
+- Keep `ALLOWED_DISCORD_IDS` restricted to the users who should access the tracker
