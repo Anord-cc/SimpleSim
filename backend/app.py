@@ -5,6 +5,7 @@ import math
 import os
 import secrets
 import sqlite3
+import threading
 import time
 from functools import wraps
 from typing import Any
@@ -69,6 +70,8 @@ ALLOWED_DISCORD_IDS = {
 VATSIM_DATA_URL = "https://data.vatsim.net/v3/vatsim-data.json"
 _vatsim_cache   = {"data": None, "fetched_at": 0}
 VATSIM_CACHE_TTL_SECONDS = max(5, int(os.environ.get("VATSIM_CACHE_TTL_SECONDS", "15")))
+TRACKER_POLL_SECONDS = max(10, int(os.environ.get("TRACKER_POLL_SECONDS", "20")))
+TRACKER_MIN_INSERT_SECONDS = max(5, int(os.environ.get("TRACKER_MIN_INSERT_SECONDS", "10")))
 SIMBRIEF_API_URL = "https://www.simbrief.com/api/xml.fetcher.php"
 SIMBRIEF_USERID = (os.environ.get("SIMBRIEF_USERID") or "").strip()
 SIMBRIEF_USERNAME = (os.environ.get("SIMBRIEF_USERNAME") or "").strip()
@@ -77,6 +80,8 @@ _simbrief_cache = {"data": None, "fetched_at": 0, "identity": None}
 MAX_SEGMENT_GAP_SECONDS = 60 * 60 * 4
 MAX_SEGMENT_DISTANCE_KM = 900
 PASSKEY_RP_NAME = os.environ.get("PASSKEY_RP_NAME", "VATSIM HeatTracker")
+_tracker_thread = None
+_tracker_lock = threading.Lock()
 
 
 def bytes_to_base64url(value: bytes) -> str:
@@ -379,6 +384,11 @@ def find_pilot(vatsim_id: str):
     return None
 
 
+def build_pilot_index(data):
+    pilots = (data or {}).get("pilots", [])
+    return {str(pilot.get("cid")): pilot for pilot in pilots if pilot.get("cid")}
+
+
 def close_active_flight(conn, vatsim_id: str):
     conn.execute(
         """
@@ -387,6 +397,74 @@ def close_active_flight(conn, vatsim_id: str):
         WHERE vatsim_id = ? AND ended_at IS NULL
         """,
         (vatsim_id,),
+    )
+
+
+def record_pilot_snapshot(conn, vatsim_id: str, pilot):
+    if not pilot:
+        return
+
+    latest = conn.execute(
+        """
+        SELECT
+            callsign,
+            lat,
+            lng,
+            altitude,
+            groundspeed,
+            CAST(strftime('%s', recorded_at) AS INTEGER) AS recorded_unix
+        FROM flight_points
+        WHERE vatsim_id = ?
+        ORDER BY recorded_at DESC, id DESC
+        LIMIT 1
+        """,
+        (vatsim_id,),
+    ).fetchone()
+
+    now_unix = int(time.time())
+    lat = pilot.get("latitude")
+    lng = pilot.get("longitude")
+    altitude = pilot.get("altitude")
+    groundspeed = pilot.get("groundspeed")
+    callsign = pilot.get("callsign")
+
+    if latest:
+        same_position = (
+            latest["callsign"] == callsign
+            and latest["lat"] == lat
+            and latest["lng"] == lng
+            and latest["altitude"] == altitude
+            and latest["groundspeed"] == groundspeed
+        )
+        latest_unix = latest["recorded_unix"] or 0
+        if same_position and now_unix - latest_unix < TRACKER_MIN_INSERT_SECONDS:
+            return
+
+    conn.execute(
+        """
+        INSERT INTO flight_points (vatsim_id, callsign, lat, lng, altitude, groundspeed)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (vatsim_id, callsign, lat, lng, altitude, groundspeed),
+    )
+
+    fp = pilot.get("flight_plan") or {}
+    conn.execute(
+        """
+        INSERT INTO flights (vatsim_id, callsign, dep, arr, aircraft)
+        SELECT ?, ?, ?, ?, ?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM flights WHERE vatsim_id = ? AND ended_at IS NULL
+        )
+        """,
+        (
+            vatsim_id,
+            callsign,
+            fp.get("departure", ""),
+            fp.get("arrival", ""),
+            fp.get("aircraft_short", ""),
+            vatsim_id,
+        ),
     )
 
 
@@ -450,6 +528,47 @@ def build_track_segments(rows):
         segments.append(current_segment)
 
     return points, segments
+
+
+def poll_linked_vatsim_users():
+    data = get_vatsim_data()
+    if not data:
+        return
+
+    pilots_by_cid = build_pilot_index(data)
+    with get_db() as conn:
+        linked_users = conn.execute(
+            "SELECT vatsim_id FROM users WHERE vatsim_id IS NOT NULL"
+        ).fetchall()
+        for row in linked_users:
+            vatsim_id = str(row["vatsim_id"])
+            pilot = pilots_by_cid.get(vatsim_id)
+            if pilot:
+                record_pilot_snapshot(conn, vatsim_id, pilot)
+            else:
+                close_active_flight(conn, vatsim_id)
+
+
+def tracker_loop():
+    while True:
+        try:
+            poll_linked_vatsim_users()
+        except Exception as exc:
+            print(f"Background tracker error: {exc}")
+        time.sleep(TRACKER_POLL_SECONDS)
+
+
+def start_background_tracker():
+    global _tracker_thread
+    with _tracker_lock:
+        if _tracker_thread and _tracker_thread.is_alive():
+            return
+        _tracker_thread = threading.Thread(
+            target=tracker_loop,
+            name="vatsim-background-tracker",
+            daemon=True,
+        )
+        _tracker_thread.start()
 
 
 def get_current_user():
@@ -536,6 +655,7 @@ def init_db():
         """)
 
 init_db()
+start_background_tracker()
 
 # ── Auth decorators ───────────────────────────────────────────────────────────
 def require_auth(fn):
@@ -903,26 +1023,7 @@ def live_flight():
         return jsonify({"online": False})
 
     with get_db() as conn:
-        conn.execute("""
-            INSERT INTO flight_points (vatsim_id, callsign, lat, lng, altitude, groundspeed)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            vatsim_id, pilot.get("callsign"),
-            pilot.get("latitude"), pilot.get("longitude"),
-            pilot.get("altitude"), pilot.get("groundspeed"),
-        ))
-        fp = pilot.get("flight_plan") or {}
-        conn.execute("""
-            INSERT INTO flights (vatsim_id, callsign, dep, arr, aircraft)
-            SELECT ?, ?, ?, ?, ?
-            WHERE NOT EXISTS (
-                SELECT 1 FROM flights WHERE vatsim_id = ? AND ended_at IS NULL
-            )
-        """, (
-            vatsim_id, pilot.get("callsign"),
-            fp.get("departure",""), fp.get("arrival",""), fp.get("aircraft_short",""),
-            vatsim_id,
-        ))
+        record_pilot_snapshot(conn, vatsim_id, pilot)
 
     return jsonify({
         "online":      True,
